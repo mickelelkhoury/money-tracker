@@ -663,6 +663,29 @@ function armConfirm(btn, label, fn){
   btn.addEventListener("click", () => { if (btn.dataset.armed) { fn(); return; } btn.dataset.armed = "1"; btn.textContent = label; });
 }
 
+/* Same line in the months after k, matched by name (ids are not unique across months). */
+function laterLines(k, sec, name){
+  const n = String(name || "").trim().toLowerCase(), out = [];
+  if (!n) return out;
+  for (const key of sortedKeys()) {
+    if (key <= k) continue;
+    const l = state.months[key][sec].find(x => String(x.name || "").trim().toLowerCase() === n);
+    if (l) out.push({ key, line: l, amount: l.amount });
+  }
+  return out;
+}
+function laterNote(later, cur){
+  const n = later.length, first = monthName(later[0].key, true), last = monthName(later[n - 1].key, true);
+  const differ = later.filter(x => r2(x.amount) !== r2(cur)).length;
+  let s = `Also planned in ${n} later month${n > 1 ? "s" : ""} (${n > 1 ? first + " to " + last : first}). Earlier months never change.`;
+  if (differ) s += differ === n ? (n > 1 ? " All of them have a different amount right now." : " It has a different amount right now.")
+                                : ` ${differ} of them ${differ > 1 ? "have" : "has"} a different amount right now.`;
+  return `<p class="hint" style="margin:-4px 0 14px">${esc(s)}</p>`;
+}
+function saveButtons(p){
+  return `<div class="actions" style="align-items:stretch"><button class="primary" id="${p}Save">This month only</button><button class="secondary" id="${p}SaveFwd">This and later months</button></div>`;
+}
+
 function lineSheet(sec, id){
   const k = viewKey, m = state.months[k]; const isNew = !id;
   const line = isNew ? { id: newId(), name: "", amount: "", type: sec === "goals" ? "spend" : undefined } : m[sec].find(l => l.id === id);
@@ -679,18 +702,28 @@ function lineSheet(sec, id){
       <p class="hint" style="margin:-6px 0 14px">Debt payments lower your debt. Savings add to your savings.</p>`;
   }
   if (!isNew && sec !== "income") h += `<p class="hint" style="margin:-4px 0 14px">${fmt(spent)} paid so far this month.</p>`;
-  h += `<div class="actions"><button class="primary" id="fSave">${isNew ? "Add" : "Save"}</button></div>`;
+  const later = isNew ? [] : laterLines(k, sec, line.name);
+  if (later.length) h += laterNote(later, line.amount) + saveButtons("f");
+  else h += `<div class="actions"><button class="primary" id="fSave">${isNew ? "Add" : "Save"}</button></div>`;
   if (!isNew) h += `<button class="danger" id="fDel">Delete this line</button>`;
   openSheet(h);
-  $("#fSave").addEventListener("click", () => {
+  const doSave = fwd => {
     const a = parseMoney($("#fAmt").value);
     if (isNaN(a)) { $("#fAmt").focus(); return; }
-    line.name = $("#fName").value.trim() || (sec === "income" ? "Income" : "Untitled");
-    line.amount = a;
-    if (sec === "goals") line.type = (document.querySelector('input[name="fType"]:checked') || {}).value || "spend";
+    const name = $("#fName").value.trim() || (sec === "income" ? "Income" : "Untitled");
+    const type = sec === "goals" ? ((document.querySelector('input[name="fType"]:checked') || {}).value || "spend") : null;
+    const targets = fwd ? [line].concat(later.map(x => x.line)) : [line];
+    const before = targets.map(l => ({ l, name: l.name, amount: l.amount, type: l.type }));
+    targets.forEach(l => { l.name = name; l.amount = a; if (type) l.type = type; });
     if (isNew) m[sec].push(line);
     closeSheet(); commit();
-  });
+    if (fwd) toast(`${name} set to ${fmt(a)} in ${targets.length} months.`, () => {
+      before.forEach(b => { b.l.name = b.name; b.l.amount = b.amount; if (type) b.l.type = b.type; });
+      commit();
+    });
+  };
+  $("#fSave").addEventListener("click", () => doSave(false));
+  const fwdBtn = $("#fSaveFwd"); if (fwdBtn) fwdBtn.addEventListener("click", () => doSave(true));
   const del = $("#fDel");
   if (del) {
     const n = m.entries.filter(e => e.line === line.id).length;
@@ -706,14 +739,25 @@ function pocketSheet(){
   const m = state.months[viewKey], t = monthTotals(viewKey), fill = r2(t.pocket + t.unplanned);
   let h = `<h3>Pocket money</h3>
     <label class="field"><span>For ${monthName(viewKey)}</span><span class="money"><span>$</span><input id="pAmt" inputmode="decimal" value="${esc(m.pocket)}" autocomplete="off"></span></label>
-    <p class="hint" style="margin:-4px 0 14px">Your everyday money: food out, coffee, small stuff.</p>
-    <div class="actions"><button class="primary" id="pSave">Save</button>`;
-  if (t.unplanned > 0.004) h += `<button class="secondary" id="pFill">Use all of it (${fmt(fill)})</button>`;
-  openSheet(h + `</div>`);
-  $("#pSave").addEventListener("click", () => {
+    <p class="hint" style="margin:-4px 0 14px">Your everyday money: food out, coffee, small stuff.</p>`;
+  const later = sortedKeys().filter(key => key > viewKey).map(key => ({ key, amount: state.months[key].pocket }));
+  if (t.unplanned > 0.004) h += `<div class="actions" style="margin:-4px 0 14px"><button class="secondary" id="pFill">Use all of it (${fmt(fill)})</button></div>`;
+  if (later.length) h += laterNote(later, m.pocket) + saveButtons("p");
+  else h += `<div class="actions"><button class="primary" id="pSave">Save</button></div>`;
+  openSheet(h);
+  const doSave = fwd => {
     const a = parseMoney($("#pAmt").value); if (isNaN(a)) { $("#pAmt").focus(); return; }
-    m.pocket = a; closeSheet(); commit();
-  });
+    const keys = [viewKey].concat(fwd ? later.map(x => x.key) : []);
+    const before = keys.map(key => [key, state.months[key].pocket]);
+    keys.forEach(key => { state.months[key].pocket = a; });
+    closeSheet(); commit();
+    if (fwd) toast(`Pocket money set to ${fmt(a)} in ${keys.length} months.`, () => {
+      before.forEach(([key, v]) => { if (state.months[key]) state.months[key].pocket = v; });
+      commit();
+    });
+  };
+  $("#pSave").addEventListener("click", () => doSave(false));
+  const fwdBtn = $("#pSaveFwd"); if (fwdBtn) fwdBtn.addEventListener("click", () => doSave(true));
   const pf = $("#pFill"); if (pf) pf.addEventListener("click", () => { $("#pAmt").value = fill; });
 }
 
