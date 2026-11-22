@@ -136,6 +136,9 @@ select{appearance:none;-webkit-appearance:none;padding-right:34px;
 .row-sub.bad{color:var(--red)}
 .row-amt{font-weight:650;white-space:nowrap}
 .tag{display:inline-block;font-size:12px;font-weight:550;padding:1px 8px;border-radius:20px;background:var(--green-soft);color:var(--green);margin-left:6px;vertical-align:1px}
+.up{color:var(--green)}
+.down{color:var(--red)}
+.note-amount.dim{color:var(--muted)}
 
 /* balances */
 .balances{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0 0}
@@ -260,6 +263,7 @@ hr{border:0;border-top:1px solid var(--rule);margin:22px 0 0}
   <button data-tab="spend"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/></svg><span>Spending</span></button>
   <button data-tab="plan"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6l1.6 1.6L8 4.8M3.5 12l1.6 1.6L8 10.8M3.5 18l1.6 1.6L8 16.8"/><path d="M11 6.5h9.5M11 12.5h9.5M11 18.5h9.5"/></svg><span>Plan</span></button>
   <button data-tab="ahead"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20.5h18"/><path d="M4 16l5-5 4 3 7-8"/><path d="M16 6h4v4"/></svg><span>Ahead</span></button>
+  <button data-tab="metals"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 20l2-6h7l2 6z"/><path d="M10.5 20l2-6h7l2 6"/><path d="M6.5 14l2-6h7l2 6"/></svg><span>Metals</span></button>
 </nav>
 
 <div class="sheet" id="sheet" hidden>
@@ -310,7 +314,32 @@ let curKey = keyOf(now);
 /* ---------- state (saved on this device only) ---------- */
 const LOCAL_KEY = "money-tracker-v1";
 const BACKUP_KEY = "money-tracker-last-backup";
-let state = { settings: null, months: {} };
+/* Gold and silver. Prices are USD per troy ounce of pure metal, from gold-api.com (free, no key). */
+const OZ = 31.1034768; // grams in a troy ounce
+const METALS = { XAU: "Gold", XAG: "Silver" };
+const PURITY = {
+  XAU: [[1, "24k (pure)"], [0.916, "22k"], [0.875, "21k"], [0.75, "18k"], [0.585, "14k"]],
+  XAG: [[1, "999 (pure)"], [0.925, "925 sterling"], [0.9, "900 coin"]]
+};
+function normMetals(x){
+  x = x || {};
+  const prices = {};
+  for (const s in METALS) {
+    const p = x.prices && x.prices[s];
+    if (p && +p.price > 0) prices[s] = { price: +p.price, updatedAt: p.updatedAt || null, fetchedAt: p.fetchedAt || null };
+  }
+  const holdings = (Array.isArray(x.holdings) ? x.holdings : [])
+    .filter(h => h && METALS[h.metal] && +h.weight > 0)
+    .map(h => ({
+      id: String(h.id || newId()), metal: h.metal, weight: +h.weight, unit: h.unit === "oz" ? "oz" : "g",
+      purity: +h.purity > 0 && +h.purity <= 1 ? +h.purity : 1,
+      paid: h.paid === null || h.paid === undefined || h.paid === "" || isNaN(+h.paid) ? null : +h.paid,
+      date: /^\d{4}-\d{2}-\d{2}$/.test(h.date || "") ? h.date : "", note: String(h.note || "")
+    }));
+  return { prices, holdings };
+}
+
+let state = { settings: null, months: {}, metals: normMetals() };
 let viewKey = curKey;
 let tab = "spend";
 let storageOk = true;
@@ -333,6 +362,7 @@ function load(){
       const o = JSON.parse(raw);
       state.settings = o.settings || null; state.months = {};
       for (const k in (o.months || {})) if (/^\d{4}-\d{2}$/.test(k)) state.months[k] = normMonth(o.months[k]);
+      state.metals = normMetals(o.metals);
     }
   } catch (e) { storageOk = false; }
 }
@@ -464,8 +494,8 @@ function togglePaid(sec, id){
 /* ---------- rendering ---------- */
 function render(){
   now = new Date(); curKey = keyOf(now);
-  const monthTabs = tab !== "ahead";
-  $("#title").textContent = monthTabs ? monthName(viewKey) : "Plan ahead";
+  const monthTabs = tab === "spend" || tab === "plan";
+  $("#title").textContent = monthTabs ? monthName(viewKey) : (tab === "ahead" ? "Plan ahead" : "Gold and silver");
   $("#prevBtn").disabled = !monthTabs; $("#nextBtn").disabled = !monthTabs;
   $("#todayBtn").hidden = !monthTabs || viewKey === curKey;
   document.querySelectorAll(".tabbar button").forEach(b => {
@@ -477,7 +507,8 @@ function render(){
   let h;
   if (tab === "spend") h = m ? logHTML(m) : emptyHTML();
   else if (tab === "plan") h = m ? planHTML(m) : emptyHTML();
-  else h = aheadHTML();
+  else if (tab === "ahead") h = aheadHTML();
+  else h = metalsHTML();
   $("#view").innerHTML = h + footHTML();
 }
 
@@ -640,9 +671,138 @@ function aheadHTML(){
   }
   return h + `</tbody></table></div><div class="actions" style="margin-top:14px"><button class="secondary" data-act="addNext">Plan ${monthName(addMonths(last, 1))}</button></div>`;
 }
+/* ---------- gold and silver ---------- */
+let metalsBusy = false, metalsErr = "";
+const fmtW = n => (+n).toLocaleString("en-US", { maximumFractionDigits: 3 });
+function parseNum(v){ const n = parseFloat(String(v || "").replace(/,/g, ".").replace(/[^0-9.]/g, "")); return isFinite(n) ? Math.round(n * 1000) / 1000 : NaN; }
+const toGrams = h => h.unit === "oz" ? h.weight * OZ : h.weight;
+function purityLabel(h){ const p = PURITY[h.metal].find(x => Math.abs(x[0] - h.purity) < 1e-6); return p ? p[1].split(" ")[0] : Math.round(h.purity * 1000) / 10 + "%"; }
+function holdingValue(h){ const p = state.metals.prices[h.metal]; return p ? toGrams(h) / OZ * h.purity * p.price : null; }
+function shortDate(iso){ const p = (iso || "").split("-").map(Number); return p.length === 3 ? `${p[2]} ${MONTHS[p[1] - 1].slice(0, 3)} ${p[0]}` : ""; }
+function gainHTML(value, paid, tail){
+  const d = r2(value - paid), pct = paid > 0 ? Math.abs(d / paid * 100).toFixed(1) : "0";
+  if (Math.abs(d) < 0.5) return `Same as the ${fmt0(paid)} ${tail}.`;
+  return `<span class="${d > 0 ? "up" : "down"}">${d > 0 ? "Up" : "Down"} ${fmt0(Math.abs(d))} (${pct}%)</span> ${d > 0 ? "on" : "from"} the ${fmt0(paid)} ${tail}.`;
+}
+function pricesAsOf(){
+  const P = state.metals.prices, p = P.XAU || P.XAG;
+  if (!p) return "No prices yet. Tap Refresh prices to get today’s gold and silver prices.";
+  const d = new Date(p.updatedAt || p.fetchedAt);
+  if (isNaN(d)) return "Prices from gold-api.com.";
+  const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const day = isoDay(d) === isoDay(new Date()) ? "today" : `${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 3)}`;
+  return `Prices from ${day} at ${time}, via gold-api.com.`;
+}
+async function refreshMetals(){
+  if (metalsBusy) return;
+  metalsBusy = true; metalsErr = ""; render();
+  const ctl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = setTimeout(() => ctl && ctl.abort(), 12000);
+  try {
+    const got = await Promise.all(Object.keys(METALS).map(async s => {
+      const r = await fetch(`https://api.gold-api.com/price/${s}`, { cache: "no-store", signal: ctl ? ctl.signal : undefined });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json(), price = +j.price;
+      if (!(price > 0)) throw new Error("No price");
+      return [s, { price, updatedAt: j.updatedAt || null, fetchedAt: new Date().toISOString() }];
+    }));
+    for (const [s, p] of got) state.metals.prices[s] = p;
+    save();
+  } catch (e) {
+    metalsErr = navigator.onLine === false ? "You’re offline. Showing the last prices you got." : "Couldn’t get prices right now. Try again in a minute.";
+  }
+  clearTimeout(timer); metalsBusy = false;
+  render();
+  if (!metalsErr) toast("Prices updated.");
+}
+function metalsHTML(){
+  const M = state.metals;
+  let total = 0, paid = 0, allPaid = M.holdings.length > 0, noPrice = false;
+  for (const x of M.holdings) {
+    const v = holdingValue(x);
+    if (v === null) noPrice = true; else total += v;
+    if (x.paid === null) allPaid = false; else paid += x.paid;
+  }
+  let h = `<section class="note"><p class="note-label">Your gold and silver is worth</p>`;
+  if (!M.holdings.length) h += `<p class="note-amount dim">$0</p><p class="note-sub">Add what you own below. Its value updates each time you refresh prices.</p>`;
+  else if (noPrice) h += `<p class="note-amount dim">—</p><p class="note-sub">Tap Refresh prices to see what it’s worth.</p>`;
+  else h += `<p class="note-amount">${fmt0(total)}</p><p class="note-sub">${allPaid && paid > 0 ? gainHTML(total, paid, "you paid") : "At the latest prices."}</p>`;
+  h += `</section><div class="balances">`;
+  for (const s in METALS) {
+    const p = M.prices[s];
+    h += `<div class="bal"><small>${METALS[s]}, per ounce</small><b>${p ? fmt(p.price) : "—"}</b><span>${p ? fmt(p.price / OZ) + " per gram" : "No price yet"}</span></div>`;
+  }
+  h += `</div><p class="hint">${esc(pricesAsOf())}</p>`;
+  if (metalsErr) h += `<p class="hint down">${esc(metalsErr)}</p>`;
+  h += `<div class="actions"><button class="secondary" data-act="metalsRefresh"${metalsBusy ? " disabled" : ""}>${metalsBusy ? "Refreshing…" : "Refresh prices"}</button></div>`;
+  for (const s in METALS) h += metalSection(s);
+  return h;
+}
+function metalSection(s){
+  const name = METALS[s], price = state.metals.prices[s];
+  const list = state.metals.holdings.filter(x => x.metal === s).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  let grams = 0, value = 0, paid = 0, allPaid = list.length > 0;
+  for (const x of list) { grams += toGrams(x); value += holdingValue(x) || 0; if (x.paid === null) allPaid = false; else paid += x.paid; }
+  const head = list.length ? `${fmtW(Math.round(grams * 100) / 100)} g${price ? " · " + fmt0(value) : ""}` : "";
+  let h = `<section class="sec"><div class="sec-head"><h2>${name}</h2><span>${head}</span></div>`;
+  if (!list.length) h += `<p class="empty">No ${name.toLowerCase()} added yet.</p>`;
+  for (const x of list) {
+    const v = holdingValue(x), tag = x.purity < 1 ? `<span class="tag">${esc(purityLabel(x))}</span>` : "";
+    const sub = [x.note, shortDate(x.date), x.paid !== null ? "paid " + fmt(x.paid) : ""].filter(Boolean).join(" · ");
+    h += `<div class="row"><button class="row-main" data-act="metal" data-id="${esc(x.id)}"><span class="row-text">
+      <span class="row-name">${fmtW(x.weight)} ${x.unit === "oz" ? "oz" : "g"}${tag}</span>${sub ? `<span class="row-sub">${esc(sub)}</span>` : ""}</span>
+      <span class="row-amt">${v === null ? "—" : fmt0(v)}</span></button></div>`;
+  }
+  if (allPaid && paid > 0 && price) h += `<p class="hint">${gainHTML(value, paid, "you paid for your " + name.toLowerCase())}</p>`;
+  return h + `<button class="link" data-act="metalAdd" data-metal="${s}">Add ${name.toLowerCase()}</button></section>`;
+}
+function metalSheet(id, metal){
+  const M = state.metals, isNew = !id;
+  const x = isNew ? { id: newId(), metal, weight: "", unit: "g", purity: 1, paid: null, date: isoDay(new Date()), note: "" }
+                  : M.holdings.find(h => h.id === id);
+  if (!x) return;
+  const name = METALS[x.metal].toLowerCase();
+  const unit = (v, t) => `<label><input type="radio" name="mUnit" value="${v}" ${x.unit === v ? "checked" : ""}><span>${t}</span></label>`;
+  const opts = PURITY[x.metal].map(([f, t]) => `<option value="${f}" ${Math.abs(f - x.purity) < 1e-6 ? "selected" : ""}>${t}</option>`).join("");
+  let h = `<h3>${isNew ? "Add " + name : "Edit " + name}</h3>
+    <label class="field"><span>Weight</span><input class="txt" id="mW" inputmode="decimal" value="${x.weight === "" ? "" : esc(x.weight)}" placeholder="0" autocomplete="off"></label>
+    <fieldset class="seg"><legend>Unit</legend><div class="seg-opts">${unit("g", "Grams")}${unit("oz", "Ounces")}</div></fieldset>
+    <label class="field"><span>Purity</span><select id="mP">${opts}</select></label>
+    <label class="field"><span>Date you got it</span><input class="txt" type="date" id="mD" value="${esc(x.date)}"></label>
+    <label class="field"><span>What you paid in total (optional)</span><span class="money"><span>$</span><input id="mPaid" inputmode="decimal" value="${x.paid === null ? "" : esc(x.paid)}" placeholder="0" autocomplete="off"></span></label>
+    <label class="field"><span>Note (optional)</span><input class="txt" id="mN" value="${esc(x.note)}" placeholder="e.g. Ring, 10 g bar" autocomplete="off"></label>
+    <p class="hint" id="mVal" style="margin:-4px 0 14px"></p>
+    <div class="actions"><button class="primary" id="mSave">${isNew ? "Add" : "Save"}</button></div>`;
+  if (!isNew) h += `<button class="danger" id="mDel">Delete</button>`;
+  openSheet(h);
+  const read = () => ({ ...x, weight: parseNum($("#mW").value), unit: (document.querySelector('input[name="mUnit"]:checked') || {}).value === "oz" ? "oz" : "g", purity: +$("#mP").value || 1 });
+  const preview = () => {
+    const y = read(), v = y.weight > 0 ? holdingValue(y) : null;
+    $("#mVal").textContent = v === null ? (M.prices[x.metal] ? "" : "Refresh prices to see what it’s worth.") : `Worth about ${fmt0(v)} at the latest price.`;
+  };
+  $("#panel").querySelectorAll("#mW, #mP, input[name=mUnit]").forEach(el => { el.addEventListener("input", preview); el.addEventListener("change", preview); });
+  preview();
+  $("#mSave").addEventListener("click", () => {
+    const y = read();
+    if (!(y.weight > 0)) { $("#mW").focus(); return; }
+    const ps = $("#mPaid").value.trim(), p = ps === "" ? null : parseMoney(ps);
+    if (ps !== "" && isNaN(p)) { $("#mPaid").focus(); return; }
+    Object.assign(x, { weight: y.weight, unit: y.unit, purity: y.purity, paid: p, date: $("#mD").value || "", note: $("#mN").value.trim() });
+    if (isNew) M.holdings.push(x);
+    closeSheet(); commit();
+  });
+  const del = $("#mDel");
+  if (del) armConfirm(del, "Tap again to delete", () => {
+    const i = M.holdings.indexOf(x); if (i >= 0) M.holdings.splice(i, 1);
+    closeSheet(); commit();
+    toast(`Deleted ${fmtW(x.weight)} ${x.unit} of ${name}.`, () => { M.holdings.splice(Math.min(i, M.holdings.length), 0, x); commit(); });
+  });
+}
+function hasData(){ return sortedKeys().length > 0 || state.metals.holdings.length > 0; }
+
 function footHTML(){
   if (!storageOk) return `<p class="foot warn">This browser isn’t letting the app save. Turn off private browsing, then reopen it.</p>`;
-  if (!sortedKeys().length) return "";
+  if (!hasData()) return "";
   const lb = lastBackup();
   if (!lb) return `<p class="foot">Saved on this device only. You haven’t backed up yet. <button data-act="backup">Back up now</button></p>`;
   const days = Math.floor((Date.now() - lb) / 86400000);
@@ -804,7 +964,7 @@ function balancesSheet(){
 }
 
 function moreSheet(){
-  const hasAny = sortedKeys().length > 0, hasMonth = !!state.months[viewKey];
+  const hasAny = sortedKeys().length > 0, hasMonth = !!state.months[viewKey], canBackup = hasData();
   let h = `<h3>Export and backup</h3>`;
   if (hasAny) {
     h += `<h4>PDF report</h4><p class="hint" style="margin:0 0 4px">A clean report to save, print or send.</p>
@@ -812,7 +972,7 @@ function moreSheet(){
       <button class="${hasMonth ? "secondary" : "primary"}" data-pdf="plan">The whole plan</button></div>`;
   }
   h += `<h4>Backup</h4><p class="hint" style="margin:0 0 4px">Your data lives only on this device. Keep a backup file in case you change phones or clear Safari.</p>
-    <div class="actions">${hasAny ? `<button class="secondary" id="mExport">Back up now</button>` : ""}
+    <div class="actions">${canBackup ? `<button class="secondary" id="mExport">Back up now</button>` : ""}
     <label class="secondary file-btn">Restore a backup<input type="file" id="mImport" accept=".json,application/json" hidden></label></div>
     <p class="hint" id="mMsg"></p>`;
   if (hasAny) h += `<hr><h4>Debt and savings</h4><button class="link" id="mBal">Change today’s debt and savings</button>`;
@@ -826,7 +986,7 @@ function moreSheet(){
     readBackup(f, o => {
       if (!o) { msg("That file isn’t a backup from this app."); return; }
       const n = Object.keys(o.months).length;
-      if (!hasAny) { restore(o); return; }
+      if (!canBackup) { restore(o); return; }
       $("#mMsg").innerHTML = `This backup has ${n} month${n === 1 ? "" : "s"}. Restoring replaces everything on this device. <button class="danger" id="mDoImport">Replace with backup</button>`;
       $("#mDoImport").addEventListener("click", () => restore(o));
     });
@@ -852,7 +1012,7 @@ async function deliver(blob, filename){
   setTimeout(() => URL.revokeObjectURL(url), 15000);
   return "downloaded";
 }
-function backupText(){ return JSON.stringify({ app: "money-tracker", version: 1, exported: new Date().toISOString(), settings: state.settings, months: state.months }, null, 2); }
+function backupText(){ return JSON.stringify({ app: "money-tracker", version: 1, exported: new Date().toISOString(), settings: state.settings, months: state.months, metals: state.metals }, null, 2); }
 async function exportBackup(msg){
   const res = await deliver(new Blob([backupText()], { type: "application/json" }), `money-backup-${isoDay(new Date())}.json`);
   if (res === "cancelled") return;
@@ -870,6 +1030,8 @@ function readBackup(file, cb){
 function restore(o){
   const months = {}; for (const k in o.months) if (/^\d{4}-\d{2}$/.test(k)) months[k] = normMonth(o.months[k]);
   state.months = months; state.settings = o.settings || null;
+  // Backups made before the Metals tab have no metals: keep what's on this device.
+  if (o.metals && typeof o.metals === "object") state.metals = normMetals(o.metals);
   closeSheet(); commit(); toast("Backup restored.");
 }
 
@@ -1089,6 +1251,9 @@ $("#view").addEventListener("click", ev => {
   else if (act === "pocket") pocketSheet();
   else if (act === "entry") entrySheet(b.dataset.id);
   else if (act === "balances") balancesSheet();
+  else if (act === "metalsRefresh") refreshMetals();
+  else if (act === "metalAdd") metalSheet(null, b.dataset.metal);
+  else if (act === "metal") metalSheet(b.dataset.id);
   else if (act === "backup") exportBackup(null);
   else if (act === "copy") createMonth(viewKey, b.dataset.from);
   else if (act === "blank") createMonth(viewKey, null);

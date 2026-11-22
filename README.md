@@ -5,6 +5,9 @@ A personal money tracker that runs as a web app on GitHub Pages.
 - Plan each month: money in, fixed bills, goals and one-offs, pocket money.
 - Log everyday spending and tick bills off as paid.
 - See debt and savings month by month in Plan ahead.
+- Track the gold and silver you own and what it's worth at today's prices.
 - Export a PDF report of one month or the whole plan.
 
-All data is saved in the browser on your own device (localStorage). Nothing is sent anywhere and nothing is stored in this repo. Use the ⋯ menu to download a backup file and to restore it.
+All data is saved in the browser on your own device (localStorage). Nothing is stored in this repo. Use the ⋯ menu to download a backup file and to restore it.
+
+The only thing the app fetches from the internet is gold and silver prices, from [gold-api.com](https://gold-api.com) (free, no key), and only when you tap **Refresh prices**. None of your data is sent with that request.
